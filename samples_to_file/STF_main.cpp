@@ -48,7 +48,7 @@ const std::string currentDateTime() {
 //Measurement globals
 //hack
 const int WIN_SAMPS = 131072;
-const int FFT_DEPTH = 2048;
+const int FFT_DEPTH = 131072;
 //const int WIN_SAMPS = 2048;
 int win_samps;
 double centre_freq, samp_rate, bandwidth, rx_gain; //WBX daughterboard only handles 40MHz BW, GbE limits useable BW to 20MHz (with 25MS/s)
@@ -158,7 +158,7 @@ void recv_to_file(
 
 	boost::unique_lock<boost::mutex> lock(recv_mutex);
 
-	if (FFT) {
+	if (FFT && false) {
 		super_cond.notify_one(); //wake the supervisor up after USRP connected
 		std::cout << "wake up supervisor - love, reciever" << std::endl;
 		recv_cond.wait(lock);
@@ -344,9 +344,9 @@ bool check_locked_sensor(std::vector<std::string> sensor_names, const char* sens
 
 int main(int argc, char*argv[]) {
 
-	_putenv_s("PYTHONPATH", ".");
-	Py_Initialize();
-	import_array();
+	//_putenv_s("PYTHONPATH", ".");
+	//Py_Initialize();
+	//import_array();
 
 	/*
 	std::cout << "To the Python mobile!" << std::endl << std::endl;
@@ -501,6 +501,19 @@ int main(int argc, char*argv[]) {
 	//Keeps track of the receiver state and each FFT threads state
 	//TODO: keep track of buffers and handle writing out/displaying. Processing of FFT'd information is also to be taken care of
 	boost::system_time time1, time2, now1, now2;
+
+
+
+	/*NEED TO ESTABLISH PINGPONG BUFFER - provide read conditions with appropriate buffer updates 
+	
+	- if FFT is too slow, then overwrite the available buffer 
+			-- assume single FFT thread for now
+	- keep track of number of fft updates versus reciever reads
+	- how to manage processing and outputting of results .... sort out the buffering first!
+
+
+
+	*/
 	while (true) {
 
 		for (int i = 0; i < NUM_THREADS; i++)
@@ -542,6 +555,7 @@ int main(int argc, char*argv[]) {
 			if (boost::cv_status::timeout == super_cond.wait_until(lock, time_limit)) {
 				if (LOG) logfile << "SuperV: Timed out! ";
 				std::cout << "A Supervisor Timeout has occured on Receive" << std::endl;
+
 			}
 			//boost::this_thread::sleep(boost::posix_time::milliseconds(.1));
 
@@ -742,7 +756,7 @@ void fftf_proc_s(std::complex<short>* re, int idx, size_t* fsz) {
 	std::cout << "launching fft thread" << std::endl;
 	boost::unique_lock<boost::mutex> lock(fft_mutex[idx]);
 	std::complex<float>* buff;
-	buff = (std::complex<float>*) malloc(sizeof(std::complex<float>) * WIN_SAMPS); //Buffer for floated samples n.n
+	buff = (std::complex<float>*) malloc(sizeof(std::complex<float>) * FFT_DEPTH); //Buffer for floated samples n.n
 
 	std::complex<short>* s_ptr = NULL;
 
@@ -755,13 +769,14 @@ void fftf_proc_s(std::complex<short>* re, int idx, size_t* fsz) {
 	int avg_count = 0;
 	const char* filename = "fftwf_plan";
 
+	int threshold = -100;
 	int frame_count = 0;
 	int error_counter = 0;
 	const int NUM_WINS = 1;
 
-	int ws_array[WIN_SAMPS];
-	unsigned char ws_frame[WIN_SAMPS];
-	int overlap[WIN_SAMPS];
+	int ws_array[FFT_DEPTH];
+	unsigned char ws_frame[FFT_DEPTH];
+	//should consider overlapping the samples, this may be a proper use for the batch fftw - ofc it adds computational complexity
 
 	//const int for number of running averages to take
 	const int AVG = 10;
@@ -772,54 +787,53 @@ void fftf_proc_s(std::complex<short>* re, int idx, size_t* fsz) {
 	int frame_number = 0;
 	bool init = false;
 
-	fft_buff = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * WIN_SAMPS); //buffer allocated for Output
-	w_array = (float*)malloc(sizeof(float) * WIN_SAMPS); //allocate memory for window coefficients
-	avg_buff = (float*)malloc(sizeof(float) * WIN_SAMPS * AVG); //buffer allocated for averaging FFT results
-	pow_buff = (float*)malloc(sizeof(float) * WIN_SAMPS); //buffer for current power levels - added with moving average code
+	fft_buff = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * FFT_DEPTH); //buffer allocated for Output
+	w_array = (float*)malloc(sizeof(float) * FFT_DEPTH); //allocate memory for window coefficients
+	avg_buff = (float*)malloc(sizeof(float) * FFT_DEPTH * AVG); //buffer allocated for averaging FFT results
+	pow_buff = (float*)malloc(sizeof(float) * FFT_DEPTH); //buffer for current power levels - added with moving average code
 
-	for (int i = 0; i < WIN_SAMPS; i++){
+	for (int i = 0; i < FFT_DEPTH; i++){
 		ws_array[i] = 0;
 		ws_frame[i] = 0;
-		overlap[i] = 0;
-		avg_buff[i] = 0;
+		pow_buff[i] = 0;
 	}
-
 
 	//added for peak detector
 	int avg_row = 0;
 	int fft_idx = 0;
+	float avg_val = 0;
 
 	for (int i = 0; i < AVG; i++) {
-		for (int j = 0; j < WIN_SAMPS; j++){
-			avg_buff[i*WIN_SAMPS + j] = 0;
+		for (int j = 0; j < FFT_DEPTH; j++){
+			avg_buff[i*FFT_DEPTH + j] = 0;
 		}
 	}
 
 	//go here fam: http://www.fftw.org/fftw3.pdf
-	int res[] = { WIN_SAMPS };
-	int stride = 1;
-	int dist = WIN_SAMPS;
+	int res[] = { FFT_DEPTH };
+	int array_stride = 1;
+	int dist = FFT_DEPTH;
 	int batch = 10; //FIXME
 
 	//Cast the std::complex<double> as a fftw_complex
 	if (!fftwf_import_wisdom_from_filename(filename)) {
 		std::cout << "should use wisdom next time :)" << std::endl;
 		
-		//plan = fftwf_plan_dft_1d(WIN_SAMPS, reinterpret_cast<fftwf_complex*>(&buff[0]), fft_buff, FFTW_FORWARD, FFTW_MEASURE);
+		plan = fftwf_plan_dft_1d(FFT_DEPTH, reinterpret_cast<fftwf_complex*>(&buff[0]), fft_buff, FFTW_FORWARD, FFTW_MEASURE);
 
 
-		plan = fftwf_plan_many_dft(1, res, batch, reinterpret_cast<fftwf_complex*>(&buff[0]), res, stride, dist, fft_buff, res, stride, dist, FFTW_FORWARD, FFTW_MEASURE);
+		//plan = fftwf_plan_many_dft(1, res, batch, reinterpret_cast<fftwf_complex*>(&buff[0]), res, array_stride, dist, fft_buff, res, array_stride, dist, FFTW_FORWARD, FFTW_MEASURE);
 		std::cout << "FFTW PLAN: " << fftwf_export_wisdom_to_filename(filename) << std::endl;
 	}
 	//plan = fftwf_plan_dft_1d(WIN_SAMPS, reinterpret_cast<fftwf_complex*>(&buff[0]), fft_buff, FFTW_FORWARD, FFTW_PATIENT);
-	else plan = fftwf_plan_dft_1d(WIN_SAMPS, reinterpret_cast<fftwf_complex*>(&buff[0]), fft_buff, FFTW_FORWARD, FFTW_MEASURE);
+	else plan = fftwf_plan_dft_1d(FFT_DEPTH, reinterpret_cast<fftwf_complex*>(&buff[0]), fft_buff, FFTW_FORWARD, FFTW_MEASURE);
 
 	//Create coefficient array and x axis index for plotting
-	for (int i = 0; i < WIN_SAMPS; i++) {
-		w_array[i] = 0.35875 - 0.48829*cos(2 * pi*i / (WIN_SAMPS - 1)) + 0.14128*cos(4 * pi*i / (WIN_SAMPS - 1)) - 0.01168*cos(6 * pi*i / (WIN_SAMPS - 1)); //blackmann harris window		
+	for (int i = 0; i < FFT_DEPTH; i++) {
+		w_array[i] = 0.35875 - 0.48829*cos(2 * pi*i / (FFT_DEPTH - 1)) + 0.14128*cos(4 * pi*i / (FFT_DEPTH - 1)) - 0.01168*cos(6 * pi*i / (FFT_DEPTH - 1)); //blackmann harris window		
 		win_power += (w_array[i] * w_array[i]); //this computes the total window power and normalises it to account for DC gain due to the window.
 	}
-	win_power /= WIN_SAMPS; //normalise the total window power across each sample.
+	win_power /= FFT_DEPTH; //normalise the total window power across each sample.
 
 
 	//std::cout << 10*std::log10(win_power) << std::endl;
@@ -833,7 +847,6 @@ void fftf_proc_s(std::complex<short>* re, int idx, size_t* fsz) {
 	std::ofstream fftout;
 	fftout.open("fftout.csv");
 
-	long long samp = 0;
 	double chars_read = 0.0;
 	int reduce = 0;
 	double last_count = 0;
@@ -850,26 +863,35 @@ void fftf_proc_s(std::complex<short>* re, int idx, size_t* fsz) {
 	pf = perffreq.QuadPart;
 	int testGPU = 0;
 
-	std::vector<float> plot(num_disp_pts, 0);
+	super_cond.notify_one();
+	fft_cond.wait(lock);
+	//fftout << "Unadulterated FFT Output \n";
+	fftout << "Power Values \n";
 
 	while (true) {
 		s_ptr = re;
 		//QueryPerformanceCounter(&wind);
 		//for (int i = 0, j = 0; i < WIN_SAMPS*2; i+=2, j++) { //WIN_SAMPS*2 BECAUSE THEY ARE COMPLEX
-		for (int i = 0; i < WIN_SAMPS; i++) {
+		for (int i = 0; i < FFT_DEPTH; i++) {
 			//Looks janky, but is actually for good reason. The modulo, is to ensure the f_ptr does not overrun buff, as buff is complex, there is 2 floats per 'float'
 			//the s_ptr points to the entire dataset cached in memory, thus it can run untill the end of the file
 
 			f_ptr[i].real(((*s_ptr).real()*1.0f / 32767.0f) * w_array[i]);
 			f_ptr[i].imag(((*s_ptr).imag()*1.0f / 32767.0f) * w_array[i]);
 			s_ptr++;
-			samp += 4;
 		}
 
 		//QueryPerformanceCounter(&ftpl);
 
 		//Spin the FFT yoooooooooo
 		fftwf_execute(plan);
+
+		//for (int i = 0; i < FFT_DEPTH; i++) {
+		//	fft_idx = ((FFT_DEPTH / 2) + i) % FFT_DEPTH;
+		//	fftout << 10 * std::log10(std::abs(fft_buff[fft_idx][0] * fft_buff[fft_idx][0] + fft_buff[fft_idx][1] * fft_buff[fft_idx][1]) / FFT_DEPTH);
+		//	if (i == FFT_DEPTH - 1) fftout << "\n";
+		//	else fftout << ",";
+		//}
 
 		//QueryPerformanceCounter(&avge);
 
@@ -883,27 +905,34 @@ void fftf_proc_s(std::complex<short>* re, int idx, size_t* fsz) {
 		*******/
 
 		//New spicy moving average code, with peak detection. Correctly rotate entries into avg_buff (could just multiply the spectrum by +1,-1,+1,-1... ), and then compute power
-		
-		for (int i = 0; i < WIN_SAMPS; i++) {
+		int peaks = 0;
+		for (int i = 0; i < FFT_DEPTH; i++) {
 
-			pow_buff[i] - avg_buff[avg_row*WIN_SAMPS + i];
+			//fftout << pow_buff[i];
+			//if (i == FFT_DEPTH - 1) fftout << "\n";
+			//else fftout << ",";
 
-			fft_idx = ((WIN_SAMPS / 2) + i) % WIN_SAMPS;
-			avg_buff[avg_row*WIN_SAMPS + i] = (
-				10 * std::log10(std::abs(fft_buff[fft_idx][0] * fft_buff[fft_idx][0] + fft_buff[fft_idx][1] * fft_buff[fft_idx][1]) / (WIN_SAMPS*AVG)) //DFT bin magnitude
-				);
+			pow_buff[i] -= avg_buff[avg_row*FFT_DEPTH + i];
 
-			pow_buff[i] + avg_buff[avg_row*WIN_SAMPS + i];
+			fft_idx = ((FFT_DEPTH / 2) + i) % FFT_DEPTH;
+			avg_val = (10 * std::log10(std::abs(fft_buff[fft_idx][0] * fft_buff[fft_idx][0] + fft_buff[fft_idx][1] * fft_buff[fft_idx][1]) / (FFT_DEPTH))) / AVG;
+
+			avg_buff[avg_row*FFT_DEPTH + i] = avg_val; //DFT bin magnitude
+			pow_buff[i] += avg_val;
 			
+
 			//now detect peaks :D 
-		//	if (i > 0 && i < WIN_SAMPS - 1){
-		//		if (pow_buff[i - 1] < pow_buff[i] && pow_buff[i + 1] < pow_buff[i]) { 
-		//			std::cout << "Peak Detected at: " << i * bandwidth/WIN_SAMPS + (centre_freq - bandwidth/2) << "Hz, Pow: " << pow_buff[i] + offset << "dbm" << std::endl; 
-		//		}
-		//	} 
+			if (i > 0 && i < FFT_DEPTH - 1){
+				if (pow_buff[i] + offset > threshold && pow_buff[i - 1] < pow_buff[i] && pow_buff[i + 1] < pow_buff[i]) { 
+					//std::cout << "Peak Detected at: " << i * bandwidth/WIN_SAMPS + (centre_freq - bandwidth/2) << "Hz, Pow: " << pow_buff[i] + offset << "dbm" << std::endl; 
+					peaks++;
+				}
+			} 
 		}
 
-		avg_row++ % AVG;
+
+		std::cout << "peaks " << peaks << std::endl;
+		++avg_row %= AVG;
 
 		//end spice
 
@@ -915,10 +944,18 @@ void fftf_proc_s(std::complex<short>* re, int idx, size_t* fsz) {
 		//Count the number of FFT frames that have been processed thus far
 		avg_count++;
 
+		if (avg_count == 13) {
+			for (int i = 0; i < FFT_DEPTH; i++) {
+				fftout << pow_buff[i];
+				if (i == FFT_DEPTH - 1) fftout << "\n";
+				else fftout << ",";
+			}
+		}
+
 
 		//Perform ws detection - Legacy code
 		/***
-		if (avg_count > 0 && avg_count%10 == 0 && false) {
+		if (avg_count > 0 && avg_count%10 == 0) {
 			//frame_count++;
 
 
@@ -988,6 +1025,7 @@ void fftf_proc_s(std::complex<short>* re, int idx, size_t* fsz) {
 
 	std::cout << "FFT[" << idx << "]: Terminating" << std::endl;
 	//destroy fft plan when all the fun is over
+	fftout.close();
 	fftwf_destroy_plan(plan);
 	fftwf_free(fft_buff);
 	fftwf_cleanup_threads();
